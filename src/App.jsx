@@ -319,55 +319,6 @@ export default function App() {
     ctx.fillText('y', 0, 0)
     ctx.restore()
 
-    // Isoclines
-    if (showIsoclines) {
-      const cValues = [-2, -1, -0.5, 0, 0.5, 1, 2]
-      const fineN = 240
-      cValues.forEach((c, idx) => {
-        // marching: for each column of t, find y where f(t,y) ≈ c (sign changes)
-        ctx.strokeStyle = c === 0 ? '#1a1715' : `rgba(80, 70, 55, ${0.38 + idx * 0.02})`
-        ctx.lineWidth = c === 0 ? 1.6 : 1
-        ctx.setLineDash(c === 0 ? [] : [3, 3])
-        ctx.beginPath()
-        for (let i = 0; i <= fineN; i++) {
-          const t = tMin + ((tMax - tMin) * i) / fineN
-          // find sign changes in y
-          const yN = 200
-          let prevY = null, prevVal = null
-          for (let j = 0; j <= yN; j++) {
-            const y = yMin + ((yMax - yMin) * j) / yN
-            const v = evalF(compiled.code, t, y) - c
-            if (prevVal !== null && isFinite(v) && isFinite(prevVal) && prevVal * v < 0) {
-              // bisect-lite
-              let a = prevY, b = y, fa = prevVal, fb = v
-              for (let k = 0; k < 12; k++) {
-                const m = 0.5 * (a + b)
-                const fm = evalF(compiled.code, t, m) - c
-                if (!isFinite(fm)) break
-                if (fa * fm < 0) { b = m; fb = fm } else { a = m; fa = fm }
-              }
-              const yRoot = 0.5 * (a + b)
-              const px = xToPx(t)
-              const py = yToPx(yRoot)
-              // We can't easily connect into curves without per-c tracking, so render dots
-              ctx.moveTo(px + 0.6, py)
-              ctx.arc(px, py, 0.6, 0, Math.PI * 2)
-            }
-            prevY = y
-            prevVal = v
-          }
-        }
-        ctx.stroke()
-        // c label at the right edge
-        ctx.setLineDash([])
-        ctx.fillStyle = c === 0 ? '#1a1715' : '#5a5347'
-        ctx.font = "500 10px 'JetBrains Mono', monospace"
-        ctx.textAlign = 'left'
-        ctx.textBaseline = 'middle'
-      })
-      ctx.setLineDash([])
-    }
-
     // Slope field segments: uniform-length using θ = atan(f)
     const cellW = plotW / density
     const cellH = plotH / density
@@ -416,6 +367,102 @@ export default function App() {
           ctx.stroke()
         }
       }
+    }
+
+    // Isoclines: curves where f(t, y) = c. Drawn AFTER the slope field so they
+    // overlay the segments and read as distinct foreground curves. Each isocline
+    // gets its own hue; the nullcline (c=0) is bold black. Curves are built by
+    // marching across columns of t, finding y-roots in each column, then
+    // connecting nearest roots between adjacent columns.
+    if (showIsoclines) {
+      const cValues = [-2, -1, -0.5, 0, 0.5, 1, 2]
+      const isoColors = {
+        '-2': '#3a5e8a', '-1': '#3a8a8a', '-0.5': '#5e8a3a',
+        '0': '#1a1715',
+        '0.5': '#c98c2a', '1': '#c1432f', '2': '#8a3a5e',
+      }
+      const fineN = 280
+      const yN = 220
+      const maxGapY = (yMax - yMin) * 0.06
+
+      cValues.forEach(c => {
+        const color = isoColors[String(c)] || '#5a5347'
+        const isNull = c === 0
+        ctx.strokeStyle = color
+        ctx.lineWidth = isNull ? 2.6 : 2.0
+        ctx.setLineDash(isNull ? [] : [6, 4])
+        ctx.lineCap = 'round'
+        ctx.lineJoin = 'round'
+
+        const columns = []
+        for (let i = 0; i <= fineN; i++) {
+          const t = tMin + ((tMax - tMin) * i) / fineN
+          const roots = []
+          let prevY = null, prevVal = null
+          for (let j = 0; j <= yN; j++) {
+            const y = yMin + ((yMax - yMin) * j) / yN
+            const v = evalF(compiled.code, t, y) - c
+            if (prevVal !== null && isFinite(v) && isFinite(prevVal) && prevVal * v < 0) {
+              let a = prevY, b = y, fa = prevVal
+              for (let k = 0; k < 14; k++) {
+                const m = 0.5 * (a + b)
+                const fm = evalF(compiled.code, t, m) - c
+                if (!isFinite(fm)) break
+                if (fa * fm < 0) { b = m } else { a = m; fa = fm }
+              }
+              roots.push(0.5 * (a + b))
+            }
+            prevY = y
+            prevVal = v
+          }
+          columns.push({ t, roots })
+        }
+
+        ctx.beginPath()
+        for (let i = 0; i < columns.length - 1; i++) {
+          const colA = columns[i]
+          const colB = columns[i + 1]
+          for (const ya of colA.roots) {
+            let best = null, bestDist = Infinity
+            for (const yb of colB.roots) {
+              const d = Math.abs(yb - ya)
+              if (d < bestDist) { bestDist = d; best = yb }
+            }
+            if (best !== null && bestDist < maxGapY) {
+              ctx.moveTo(xToPx(colA.t), yToPx(ya))
+              ctx.lineTo(xToPx(colB.t), yToPx(best))
+            }
+          }
+        }
+        ctx.stroke()
+
+        // Label each isocline near the rightmost column with a root
+        ctx.setLineDash([])
+        for (let i = columns.length - 1; i >= 0; i--) {
+          if (columns[i].roots.length > 0) {
+            const tLab = columns[i].t
+            const yLabel = columns[i].roots.reduce((a, b) => yToPx(a) < yToPx(b) ? a : b)
+            const px = xToPx(tLab)
+            const py = yToPx(yLabel)
+            if (px < PAD_L + plotW - 6 && py > PAD_T + 10 && py < PAD_T + plotH - 6) {
+              ctx.font = `${isNull ? '700' : '600'} 11px 'JetBrains Mono', monospace`
+              ctx.textAlign = 'left'
+              ctx.textBaseline = 'middle'
+              const label = `c=${c}`
+              const tw = ctx.measureText(label).width
+              ctx.fillStyle = 'rgba(250, 246, 236, 0.92)'
+              ctx.fillRect(px + 4, py - 8, tw + 6, 16)
+              ctx.strokeStyle = color
+              ctx.lineWidth = 1
+              ctx.strokeRect(px + 4, py - 8, tw + 6, 16)
+              ctx.fillStyle = color
+              ctx.fillText(label, px + 7, py)
+            }
+            break
+          }
+        }
+      })
+      ctx.setLineDash([])
     }
 
     // ----- Phase line panel (autonomous only) -----
