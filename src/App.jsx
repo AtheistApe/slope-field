@@ -508,12 +508,12 @@ export default function App() {
         const arrowY = yToPx(yMid)
         // Available pixel space in this subinterval; leave margin near equilibria.
         const intervalPx = Math.abs(yToPx(yLo) - yToPx(yHi))
-        const halfLen = Math.max(8, Math.min(28, intervalPx * 0.32))
-        const ahLen = Math.max(7, halfLen * 0.55)
-        const ahWidth = Math.max(5, halfLen * 0.42)
+        const halfLen = Math.max(7, Math.min(24, intervalPx * 0.30))
+        const ahLen = Math.max(5, halfLen * 0.42)
+        const ahWidth = Math.max(3.5, halfLen * 0.30)
         ctx.strokeStyle = '#c1432f'
         ctx.fillStyle = '#c1432f'
-        ctx.lineWidth = 3.5
+        ctx.lineWidth = 3
         ctx.lineCap = 'round'
         // shaft (stops short of the tip so the arrowhead reads as solid)
         ctx.beginPath()
@@ -531,7 +531,10 @@ export default function App() {
         ctx.fill()
       }
 
-      // Equilibria dots
+      // Equilibria dots on the phase line — original size (5.5 px). The visual
+      // emphasis on equilibria lives on the field plot itself (horizontal lines
+      // y = y*), not here. Semi-stable circles are oriented so the FILLED half
+      // marks the stable side.
       sorted.forEach(eq => {
         const py = yToPx(eq.y)
         ctx.lineWidth = 2
@@ -543,10 +546,21 @@ export default function App() {
           ctx.strokeStyle = '#1a1715'
           ctx.beginPath(); ctx.arc(lineX, py, 5.5, 0, Math.PI * 2); ctx.fill(); ctx.stroke()
         } else {
-          // semi-stable: half-filled
+          // Semi-stable. Determine which side is stable:
+          //   semi-up   (f > 0 on both sides): stable below, unstable above.
+          //   semi-down (f < 0 on both sides): stable above, unstable below.
+          // Screen y is flipped (smaller py = larger y), so "below" = lower half.
+          const stableIsLower = eq.kind === 'semi-up'
+          ctx.fillStyle = '#faf6ec'
+          ctx.beginPath(); ctx.arc(lineX, py, 5.5, 0, Math.PI * 2); ctx.fill()
           ctx.fillStyle = '#1a1715'
           ctx.beginPath()
-          ctx.arc(lineX, py, 5.5, eq.kind === 'semi-up' ? -Math.PI / 2 : Math.PI / 2, eq.kind === 'semi-up' ? Math.PI / 2 : 3 * Math.PI / 2)
+          if (stableIsLower) {
+            ctx.arc(lineX, py, 5.5, 0, Math.PI, false)
+          } else {
+            ctx.arc(lineX, py, 5.5, Math.PI, 2 * Math.PI, false)
+          }
+          ctx.closePath()
           ctx.fill()
           ctx.strokeStyle = '#1a1715'
           ctx.beginPath(); ctx.arc(lineX, py, 5.5, 0, Math.PI * 2); ctx.stroke()
@@ -559,17 +573,53 @@ export default function App() {
         ctx.fillText(`y=${eq.y.toFixed(3)}`, lineX + 10, py)
       })
 
-      // Also draw faint horizontal guides from equilibria into the field
-      ctx.strokeStyle = 'rgba(193, 67, 47, 0.18)'
-      ctx.setLineDash([4, 4])
-      ctx.lineWidth = 1
+      // Stationary solutions on the slope field. Each equilibrium y* gives a
+      // constant solution y(t) = y* — these ARE solutions of the ODE and deserve
+      // to be drawn as such. Render them as bold horizontal lines across the
+      // entire plot, styled by stability:
+      //   stable    → solid, heavy red
+      //   unstable  → dashed, medium red
+      //   semi      → dash-dot, medium red
+      // Plus a small label "y = y*" at the right edge of the field.
       sorted.forEach(eq => {
         const py = yToPx(eq.y)
-        if (py < PAD_T || py > PAD_T + plotH) return
+        if (py < PAD_T - 1 || py > PAD_T + plotH + 1) return
+        ctx.strokeStyle = '#c1432f'
+        ctx.lineCap = 'butt'
+        if (eq.kind === 'stable') {
+          ctx.lineWidth = 2.6
+          ctx.setLineDash([])
+        } else if (eq.kind === 'unstable') {
+          ctx.lineWidth = 2.2
+          ctx.setLineDash([10, 5])
+        } else {
+          ctx.lineWidth = 2.2
+          ctx.setLineDash([10, 4, 2, 4])
+        }
         ctx.beginPath()
         ctx.moveTo(PAD_L, py)
         ctx.lineTo(PAD_L + plotW, py)
         ctx.stroke()
+        ctx.setLineDash([])
+
+        // Right-edge label chip with the stability kind, e.g. "y = 1 (stable)"
+        ctx.font = "600 11px 'JetBrains Mono', monospace"
+        ctx.textAlign = 'right'
+        ctx.textBaseline = 'middle'
+        const kindLabel = eq.kind === 'stable' ? 'stable'
+                        : eq.kind === 'unstable' ? 'unstable'
+                        : 'semi-stable'
+        const text = `y = ${eq.y.toFixed(3)} · ${kindLabel}`
+        const tw = ctx.measureText(text).width
+        const chipX = PAD_L + plotW - 6
+        const chipY = py
+        ctx.fillStyle = 'rgba(250, 246, 236, 0.92)'
+        ctx.fillRect(chipX - tw - 8, chipY - 9, tw + 8, 18)
+        ctx.strokeStyle = '#c1432f'
+        ctx.lineWidth = 1
+        ctx.strokeRect(chipX - tw - 8, chipY - 9, tw + 8, 18)
+        ctx.fillStyle = '#c1432f'
+        ctx.fillText(text, chipX - 4, chipY)
       })
       ctx.setLineDash([])
     }
@@ -619,13 +669,70 @@ export default function App() {
     })
     ctx.restore()
 
-    // Hover crosshair
+    // Hover crosshair, value label, and (optionally) the isocline through the cursor.
     if (hoverPt) {
       ctx.save()
       ctx.beginPath()
       ctx.rect(PAD_L, PAD_T, plotW, plotH)
       ctx.clip()
-      ctx.strokeStyle = 'rgba(26, 23, 21, 0.35)'
+
+      // Compute f at the cursor for both the label and the isocline c value.
+      const slopeHere = compiled.code ? evalF(compiled.code, hoverPt.t, hoverPt.y) : NaN
+
+      // Dynamic isocline: f(t,y) = slopeHere through the cursor point.
+      // Drawn before the crosshair so the dashed crosshair sits on top of it.
+      if (showIsoclines && isFinite(slopeHere)) {
+        const c = slopeHere
+        const fineN = 280
+        const yN = 220
+        const maxGapY = (yMax - yMin) * 0.06
+        const columns = []
+        for (let i = 0; i <= fineN; i++) {
+          const t = tMin + ((tMax - tMin) * i) / fineN
+          const roots = []
+          let prevY = null, prevVal = null
+          for (let j = 0; j <= yN; j++) {
+            const y = yMin + ((yMax - yMin) * j) / yN
+            const v = evalF(compiled.code, t, y) - c
+            if (prevVal !== null && isFinite(v) && isFinite(prevVal) && prevVal * v < 0) {
+              let a = prevY, b = y, fa = prevVal
+              for (let k = 0; k < 14; k++) {
+                const m = 0.5 * (a + b)
+                const fm = evalF(compiled.code, t, m) - c
+                if (!isFinite(fm)) break
+                if (fa * fm < 0) { b = m } else { a = m; fa = fm }
+              }
+              roots.push(0.5 * (a + b))
+            }
+            prevY = y; prevVal = v
+          }
+          columns.push({ t, roots })
+        }
+        ctx.strokeStyle = '#2f6fc1'
+        ctx.lineWidth = 2.2
+        ctx.setLineDash([8, 4])
+        ctx.lineCap = 'round'
+        ctx.beginPath()
+        for (let i = 0; i < columns.length - 1; i++) {
+          const colA = columns[i], colB = columns[i + 1]
+          for (const ya of colA.roots) {
+            let best = null, bestDist = Infinity
+            for (const yb of colB.roots) {
+              const d = Math.abs(yb - ya)
+              if (d < bestDist) { bestDist = d; best = yb }
+            }
+            if (best !== null && bestDist < maxGapY) {
+              ctx.moveTo(xToPx(colA.t), yToPx(ya))
+              ctx.lineTo(xToPx(colB.t), yToPx(best))
+            }
+          }
+        }
+        ctx.stroke()
+        ctx.setLineDash([])
+      }
+
+      // Crosshair
+      ctx.strokeStyle = 'rgba(26, 23, 21, 0.4)'
       ctx.setLineDash([2, 4])
       ctx.lineWidth = 1
       ctx.beginPath()
@@ -636,8 +743,43 @@ export default function App() {
       ctx.stroke()
       ctx.setLineDash([])
       ctx.restore()
+
+      // Cursor dot (small, on top of crosshair) — draws outside the clip so it
+      // stays crisp even at the plot border.
+      ctx.fillStyle = '#c1432f'
+      ctx.beginPath()
+      ctx.arc(hoverPt.px, hoverPt.py, 3, 0, Math.PI * 2)
+      ctx.fill()
+      ctx.strokeStyle = '#faf6ec'
+      ctx.lineWidth = 1.5
+      ctx.stroke()
+
+      // Floating label near cursor: y'(t, y) = value
+      const labelText = isFinite(slopeHere)
+        ? `y′(${hoverPt.t.toFixed(2)}, ${hoverPt.y.toFixed(2)}) = ${slopeHere.toFixed(3)}`
+        : `(${hoverPt.t.toFixed(2)}, ${hoverPt.y.toFixed(2)})  undefined`
+      ctx.font = "600 12px 'JetBrains Mono', monospace"
+      ctx.textAlign = 'left'
+      ctx.textBaseline = 'top'
+      const tw = ctx.measureText(labelText).width
+      const padX = 8, padY = 5, lh = 18
+      // Choose label corner: prefer upper-right of cursor, flip if it would clip.
+      let lx = hoverPt.px + 12
+      let ly = hoverPt.py - lh - 8
+      if (lx + tw + padX * 2 > PAD_L + plotW) lx = hoverPt.px - tw - padX * 2 - 12
+      if (ly < PAD_T + 4) ly = hoverPt.py + 12
+      // background card
+      ctx.fillStyle = 'rgba(26, 23, 21, 0.92)'
+      ctx.beginPath()
+      const rectArgs = [lx, ly, tw + padX * 2, lh + padY]
+      ctx.fillRect(...rectArgs)
+      ctx.strokeStyle = '#c1432f'
+      ctx.lineWidth = 1.2
+      ctx.strokeRect(...rectArgs)
+      ctx.fillStyle = '#faf6ec'
+      ctx.fillText(labelText, lx + padX, ly + padY + 1)
     }
-  }, [solutions, canvasSize, xToPx, yToPx, plotW, plotH, hoverPt])
+  }, [solutions, canvasSize, xToPx, yToPx, plotW, plotH, hoverPt, compiled.code, showIsoclines, tMin, tMax, yMin, yMax])
 
   // ----- Click handler: integrate forward and backward -----
   const handleClick = (e) => {
@@ -1026,9 +1168,14 @@ function EqLegend({ equilibria }) {
 }
 
 function EqDot({ kind }) {
-  if (kind === 'stable') return <span style={{ width: 10, height: 10, background: '#1a1715', borderRadius: '50%', display: 'inline-block' }} />
-  if (kind === 'unstable') return <span style={{ width: 10, height: 10, background: '#fffdf6', border: '1.5px solid #1a1715', borderRadius: '50%', display: 'inline-block' }} />
-  return <span style={{ width: 10, height: 10, background: 'linear-gradient(90deg, #1a1715 50%, #fffdf6 50%)', border: '1.5px solid #1a1715', borderRadius: '50%', display: 'inline-block' }} />
+  if (kind === 'stable') return <span style={{ width: 11, height: 11, background: '#1a1715', borderRadius: '50%', display: 'inline-block', flexShrink: 0 }} />
+  if (kind === 'unstable') return <span style={{ width: 11, height: 11, background: '#fffdf6', border: '1.5px solid #1a1715', borderRadius: '50%', display: 'inline-block', flexShrink: 0 }} />
+  // semi-up: stable below ⇒ bottom half filled
+  // semi-down: stable above ⇒ top half filled
+  const grad = kind === 'semi-up'
+    ? 'linear-gradient(180deg, #fffdf6 50%, #1a1715 50%)'
+    : 'linear-gradient(180deg, #1a1715 50%, #fffdf6 50%)'
+  return <span style={{ width: 11, height: 11, background: grad, border: '1.5px solid #1a1715', borderRadius: '50%', display: 'inline-block', flexShrink: 0 }} />
 }
 
 function labelKind(k) {
