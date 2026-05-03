@@ -40,26 +40,29 @@ function evalF(code, t, y) {
   }
 }
 
-// Symbolic-ish autonomy check: sample f(t1,y) - f(t2,y) on a coarse grid.
-// If max |Δ| is below a tiny relative tolerance, treat as autonomous.
+// Symbolic-ish autonomy check: sample f(t,y) on a coarse grid and look at
+// variation across t for each fixed y. If max |Δ| is below a tiny relative
+// tolerance, treat as autonomous. We sample 5 t-values (not just the endpoints)
+// to avoid period-aliasing — e.g. if (tMax - tMin) happens to be a period of
+// f's t-dependence, endpoint-only sampling would falsely report autonomous.
 function isAutonomous(code, tMin, tMax, yMin, yMax) {
   if (!code) return false
   const ys = 9
-  const ts = 7
-  const t1 = tMin
-  const t2 = tMax
+  const ts = 5
   let maxDelta = 0
   let maxAbs = 0
   for (let i = 0; i < ys; i++) {
     const y = yMin + ((yMax - yMin) * i) / (ys - 1)
-    for (let j = 0; j < ts; j++) {
+    // Reference value at the first t-sample.
+    const ref = evalF(code, tMin, y)
+    if (!isFinite(ref)) continue
+    maxAbs = Math.max(maxAbs, Math.abs(ref))
+    for (let j = 1; j < ts; j++) {
       const tj = tMin + ((tMax - tMin) * j) / (ts - 1)
-      const a = evalF(code, t1, y)
-      const b = evalF(code, t2, y)
-      const c = evalF(code, tj, y)
-      if (isFinite(a) && isFinite(b) && isFinite(c)) {
-        maxDelta = Math.max(maxDelta, Math.abs(a - b), Math.abs(a - c))
-        maxAbs = Math.max(maxAbs, Math.abs(a), Math.abs(b), Math.abs(c))
+      const v = evalF(code, tj, y)
+      if (isFinite(v)) {
+        maxDelta = Math.max(maxDelta, Math.abs(v - ref))
+        maxAbs = Math.max(maxAbs, Math.abs(v))
       }
     }
   }
@@ -67,7 +70,11 @@ function isAutonomous(code, tMin, tMax, yMin, yMax) {
   return maxDelta < tol
 }
 
-// Find equilibria of f(y) (assumed autonomous) over [yMin, yMax] by bracketed bisection.
+// Find equilibria of f(y) (assumed autonomous) over [yMin, yMax] by bracketed
+// bisection. We evaluate f at t=0 throughout — for a truly autonomous f the
+// t value is irrelevant; for a non-autonomous f forced to autonomous via the
+// override, we're effectively asking "where are the equilibria of the t=0
+// snapshot of f(t,·)?" which is the most defensible single-snapshot choice.
 function findEquilibria(code, yMin, yMax) {
   const N = 800
   const samples = new Float64Array(N + 1)
@@ -144,22 +151,55 @@ function integrate(code, t0, y0, tEnd, yBounds, direction = 1) {
   const guard = (yBounds[1] - yBounds[0]) * 4 // give margin off-screen
   const yLo = yBounds[0] - guard
   const yHi = yBounds[1] + guard
+  const yRange = yBounds[1] - yBounds[0]
+  // A "blowup" slope: |dy/dt| big enough that the solution is effectively
+  // vertical on screen — past this, the IVP solution doesn't extend further.
+  // Threshold: a single t-step (~ span/1500) would jump roughly yRange/30,
+  // i.e. one cell in a 30-cell vertical grid.
+  const slopeBlowup = (yRange / Math.abs(h)) / 30
   let steps = 0
   const maxSteps = 8000
   while (steps < maxSteps && ((direction > 0 && t < tEnd) || (direction < 0 && t > tEnd))) {
     let hh = h
     if ((direction > 0 && t + hh > tEnd) || (direction < 0 && t + hh < tEnd)) hh = tEnd - t
+
+    // Pre-step singularity check: if f is undefined or pathological at the
+    // current point, the IVP solution doesn't extend further in this direction.
+    const slopeNow = evalF(code, t, y)
+    if (!isFinite(slopeNow) || Math.abs(slopeNow) > slopeBlowup) break
+
     let yNext = rk4Step(code, t, y, hh)
     if (yNext === null || !isFinite(yNext)) break
-    // adaptive: if the jump is too big, halve
+
+    // Adaptive halving: shrink hh until the jump is reasonable.
     let tries = 0
-    while (Math.abs(yNext - y) > (yBounds[1] - yBounds[0]) * 0.05 && Math.abs(hh) > minH && tries < 8) {
+    while (Math.abs(yNext - y) > yRange * 0.05 && Math.abs(hh) > minH && tries < 8) {
       hh *= 0.5
       yNext = rk4Step(code, t, y, hh)
       if (yNext === null) break
       tries++
     }
     if (yNext === null || !isFinite(yNext)) break
+
+    // If we exhausted the halving budget and the jump is STILL huge, we're at
+    // a singularity. Refuse the bad step rather than accepting it (which would
+    // drop the solution onto a garbage y value and produce noise on the curve).
+    if (Math.abs(yNext - y) > yRange * 0.5) break
+
+    // Mid-step undefined-f check: if f becomes undefined or pathological
+    // anywhere along the proposed step (e.g. crossing y = 0 for y' = -t/y),
+    // the solution curve doesn't continue through it. Sample interior points
+    // AND check the proposed endpoint. We bail BEFORE appending so the curve
+    // doesn't include a point on the wrong side of the singularity.
+    let crossed = false
+    for (let k = 1; k <= 4; k++) {
+      const yk = y + (k / 4) * (yNext - y)
+      const tk = t + (k / 4) * hh
+      const fk = evalF(code, tk, yk)
+      if (!isFinite(fk) || Math.abs(fk) > slopeBlowup) { crossed = true; break }
+    }
+    if (crossed) break
+
     t += hh
     y = yNext
     pts.push([t, y])
@@ -190,6 +230,8 @@ export default function App() {
   const [solutions, setSolutions] = useState([]) // { t0, y0, fwd, bwd, color }
   const [presetOpen, setPresetOpen] = useState(false)
   const [hoverPt, setHoverPt] = useState(null)
+  const [icT0, setIcT0] = useState(0)
+  const [icY0, setIcY0] = useState(1)
 
   const fieldCanvasRef = useRef(null)
   const overlayCanvasRef = useRef(null)
@@ -375,19 +417,17 @@ export default function App() {
     // marching across columns of t, finding y-roots in each column, then
     // connecting nearest roots between adjacent columns.
     if (showIsoclines) {
-      const cValues = [-2, -1, -0.5, 0, 0.5, 1, 2]
-      const isoColors = {
-        '-2': '#3a5e8a', '-1': '#3a8a8a', '-0.5': '#5e8a3a',
-        '0': '#1a1715',
-        '0.5': '#c98c2a', '1': '#c1432f', '2': '#8a3a5e',
-      }
+      const cValues = pickIsoclineValues(compiled.code, tMin, tMax, yMin, yMax)
+      // Color by position: nullcline (c=0) bold black, others spread across a
+      // cool→warm palette by index relative to zero.
+      const isoPalette = ['#3a5e8a', '#3a8a8a', '#5e8a3a', '#c98c2a', '#c1432f', '#8a3a5e']
       const fineN = 280
       const yN = 220
       const maxGapY = (yMax - yMin) * 0.06
 
-      cValues.forEach(c => {
-        const color = isoColors[String(c)] || '#5a5347'
-        const isNull = c === 0
+      cValues.forEach((c, idx) => {
+        const isNull = Math.abs(c) < 1e-12
+        const color = isNull ? '#1a1715' : isoPalette[idx % isoPalette.length]
         ctx.strokeStyle = color
         ctx.lineWidth = isNull ? 2.6 : 2.0
         ctx.setLineDash(isNull ? [] : [6, 4])
@@ -448,7 +488,7 @@ export default function App() {
               ctx.font = `${isNull ? '700' : '600'} 11px 'JetBrains Mono', monospace`
               ctx.textAlign = 'left'
               ctx.textBaseline = 'middle'
-              const label = `c=${c}`
+              const label = `c=${formatTick(c, Math.max(1e-3, Math.abs(c) || 1) * 0.1)}`
               const tw = ctx.measureText(label).width
               ctx.fillStyle = 'rgba(250, 246, 236, 0.92)'
               ctx.fillRect(px + 4, py - 8, tw + 6, 16)
@@ -781,6 +821,18 @@ export default function App() {
     }
   }, [solutions, canvasSize, xToPx, yToPx, plotW, plotH, hoverPt, compiled.code, showIsoclines, tMin, tMax, yMin, yMax])
 
+  // Integrate forward and backward through a given (t0, y0) and append to
+  // the solutions list. Used by both the click handler and the IC form.
+  const addSolution = useCallback((t0, y0) => {
+    if (!compiled.code) return
+    const fwd = integrate(compiled.code, t0, y0, tMax + (tMax - tMin) * 0.05, [yMin, yMax], 1)
+    const bwd = integrate(compiled.code, t0, y0, tMin - (tMax - tMin) * 0.05, [yMin, yMax], -1)
+    setSolutions(prev => {
+      const color = COLORS[prev.length % COLORS.length]
+      return [...prev, { t0, y0, fwd, bwd, color }]
+    })
+  }, [compiled.code, tMin, tMax, yMin, yMax])
+
   // ----- Click handler: integrate forward and backward -----
   const handleClick = (e) => {
     if (!compiled.code) return
@@ -790,10 +842,7 @@ export default function App() {
     if (px < PAD_L || px > PAD_L + plotW || py < PAD_T || py > PAD_T + plotH) return
     const t0 = pxToX(px)
     const y0 = pxToY(py)
-    const fwd = integrate(compiled.code, t0, y0, tMax + (tMax - tMin) * 0.05, [yMin, yMax], 1)
-    const bwd = integrate(compiled.code, t0, y0, tMin - (tMax - tMin) * 0.05, [yMin, yMax], -1)
-    const color = COLORS[solutions.length % COLORS.length]
-    setSolutions(prev => [...prev, { t0, y0, fwd, bwd, color }])
+    addSolution(t0, y0)
   }
 
   const handleMouseMove = (e) => {
@@ -928,6 +977,28 @@ export default function App() {
             <PanelLabel>Solutions</PanelLabel>
             <div style={{ fontSize: 11, color: '#5a5347', marginBottom: 10, lineHeight: 1.5 }}>
               Click anywhere in the plot to integrate the IVP through that point — both directions.
+            </div>
+            <div style={{
+              display: 'flex', alignItems: 'center', gap: 6, marginBottom: 10,
+              padding: '8px 8px', background: '#faf6ec',
+              border: '1px solid #d8d2c0', borderRadius: 3,
+            }}>
+              <span style={{ fontFamily: "'Fraunces', serif", fontStyle: 'italic', fontSize: 12, color: '#1a1715' }}>y(</span>
+              <NumberCell value={icT0} onChange={setIcT0} />
+              <span style={{ fontFamily: "'Fraunces', serif", fontStyle: 'italic', fontSize: 12, color: '#1a1715' }}>) =</span>
+              <NumberCell value={icY0} onChange={setIcY0} />
+              <button
+                onClick={() => addSolution(icT0, icY0)}
+                style={{
+                  background: '#1a1715', color: '#faf6ec',
+                  border: 'none', borderRadius: 3, padding: '5px 10px',
+                  fontFamily: "'JetBrains Mono', monospace", fontSize: 11,
+                  fontWeight: 600, cursor: 'pointer', flexShrink: 0,
+                }}
+                title="Integrate from this initial condition"
+              >
+                <Play size={11} style={{ verticalAlign: 'middle' }} />
+              </button>
             </div>
             <div style={{ display: 'flex', gap: 8 }}>
               <button onClick={() => setSolutions([])} style={iconBtnStyle} title="Clear all">
@@ -1204,6 +1275,43 @@ function formatTick(v, step) {
   return v.toFixed(decimals)
 }
 
+// Pick a reasonable set of isocline c-values for the visible window. We sample
+// f over the plot area, find a robust range (10th–90th percentile of finite
+// values to ignore singularity spikes), then snap to "nice" values that include
+// 0 (the nullcline) when 0 is in range.
+function pickIsoclineValues(code, tMin, tMax, yMin, yMax) {
+  if (!code) return [0]
+  const N = 24
+  const samples = []
+  for (let i = 0; i < N; i++) {
+    const t = tMin + ((tMax - tMin) * (i + 0.5)) / N
+    for (let j = 0; j < N; j++) {
+      const y = yMin + ((yMax - yMin) * (j + 0.5)) / N
+      const v = evalF(code, t, y)
+      if (isFinite(v)) samples.push(v)
+    }
+  }
+  if (samples.length < 4) return [0]
+  samples.sort((a, b) => a - b)
+  const lo = samples[Math.floor(samples.length * 0.1)]
+  const hi = samples[Math.floor(samples.length * 0.9)]
+  if (!isFinite(lo) || !isFinite(hi) || hi <= lo) return [0]
+  // Pick a step that yields ~6 contour lines across the range.
+  const step = niceStep(hi - lo)
+  const values = []
+  for (let v = Math.ceil(lo / step) * step; v <= hi + step * 0.01; v += step) {
+    // Round to step precision to avoid floating-point trash in labels.
+    const rounded = Math.round(v / step) * step
+    values.push(rounded)
+  }
+  // Always include 0 if it's in the range, even if the step grid missed it.
+  if (lo <= 0 && hi >= 0 && !values.some(v => Math.abs(v) < step * 0.01)) {
+    values.push(0)
+    values.sort((a, b) => a - b)
+  }
+  return values.length > 0 ? values : [0]
+}
+
 // ----- SVG export -----
 function buildSVG({ expr, tMin, tMax, yMin, yMax, density, lengthMul, compiled, autonomous, equilibria, solutions, showArrows, showIsoclines, canvasSize, PAD_L, PAD_R, PAD_T, PAD_B, phaseLineW, plotW, plotH }) {
   const xToPx = t => PAD_L + ((t - tMin) / (tMax - tMin)) * plotW
@@ -1215,18 +1323,30 @@ function buildSVG({ expr, tMin, tMax, yMin, yMax, density, lengthMul, compiled, 
   const parts = []
   parts.push(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" font-family="Inter Tight, sans-serif">`)
   parts.push(`<rect width="${W}" height="${H}" fill="#faf6ec"/>`)
-  parts.push(`<rect x="${PAD_L}" y="${PAD_T}" width="${plotW}" height="${plotH}" fill="#faf6ec" stroke="#8a8170" stroke-width="1.5"/>`)
+  parts.push(`<rect x="${PAD_L}" y="${PAD_T}" width="${plotW}" height="${plotH}" fill="#faf6ec"/>`)
+
   // Grid
   let g = ''
-  for (let t = Math.ceil(tMin / tStep) * tStep; t <= tMax; t += tStep) {
+  for (let t = Math.ceil(tMin / tStep) * tStep; t <= tMax + 1e-9; t += tStep) {
     const x = xToPx(t)
-    g += `<line x1="${x}" y1="${PAD_T}" x2="${x}" y2="${PAD_T + plotH}" stroke="#e3dccb"/>`
+    g += `<line x1="${x.toFixed(2)}" y1="${PAD_T}" x2="${x.toFixed(2)}" y2="${PAD_T + plotH}" stroke="#e3dccb"/>`
   }
-  for (let y = Math.ceil(yMin / yStep) * yStep; y <= yMax; y += yStep) {
+  for (let y = Math.ceil(yMin / yStep) * yStep; y <= yMax + 1e-9; y += yStep) {
     const py = yToPx(y)
-    g += `<line x1="${PAD_L}" y1="${py}" x2="${PAD_L + plotW}" y2="${py}" stroke="#e3dccb"/>`
+    g += `<line x1="${PAD_L}" y1="${py.toFixed(2)}" x2="${PAD_L + plotW}" y2="${py.toFixed(2)}" stroke="#e3dccb"/>`
   }
   parts.push(g)
+
+  // Zero axes
+  if (tMin <= 0 && tMax >= 0) {
+    const x0 = xToPx(0)
+    parts.push(`<line x1="${x0.toFixed(2)}" y1="${PAD_T}" x2="${x0.toFixed(2)}" y2="${PAD_T + plotH}" stroke="#bdb39c" stroke-width="1.2"/>`)
+  }
+  if (yMin <= 0 && yMax >= 0) {
+    const y0 = yToPx(0)
+    parts.push(`<line x1="${PAD_L}" y1="${y0.toFixed(2)}" x2="${PAD_L + plotW}" y2="${y0.toFixed(2)}" stroke="#bdb39c" stroke-width="1.2"/>`)
+  }
+
   // Slope field
   let f = ''
   const cellMin = Math.min(plotW / density, plotH / density)
@@ -1243,36 +1363,173 @@ function buildSVG({ expr, tMin, tMax, yMin, yMax, density, lengthMul, compiled, 
       const dx = (segLen / 2) * Math.cos(theta)
       const dy = (segLen / 2) * Math.sin(theta)
       f += `<line x1="${(cx - dx).toFixed(2)}" y1="${(cy - dy).toFixed(2)}" x2="${(cx + dx).toFixed(2)}" y2="${(cy + dy).toFixed(2)}" stroke="#2a2520" stroke-width="1.1" stroke-linecap="round"/>`
+      if (showArrows) {
+        const ah = Math.min(3.5, segLen * 0.22)
+        const tipX = cx + dx, tipY = cy + dy
+        const a1x = tipX - ah * Math.cos(theta - 0.5)
+        const a1y = tipY - ah * Math.sin(theta - 0.5)
+        const a2x = tipX - ah * Math.cos(theta + 0.5)
+        const a2y = tipY - ah * Math.sin(theta + 0.5)
+        f += `<line x1="${tipX.toFixed(2)}" y1="${tipY.toFixed(2)}" x2="${a1x.toFixed(2)}" y2="${a1y.toFixed(2)}" stroke="#2a2520" stroke-width="1.1" stroke-linecap="round"/>`
+        f += `<line x1="${tipX.toFixed(2)}" y1="${tipY.toFixed(2)}" x2="${a2x.toFixed(2)}" y2="${a2y.toFixed(2)}" stroke="#2a2520" stroke-width="1.1" stroke-linecap="round"/>`
+      }
     }
   }
   parts.push(f)
+
+  // Isoclines (using the same auto-picked values as the canvas)
+  if (showIsoclines) {
+    const cValues = pickIsoclineValues(compiled.code, tMin, tMax, yMin, yMax)
+    const isoPalette = ['#3a5e8a', '#3a8a8a', '#5e8a3a', '#c98c2a', '#c1432f', '#8a3a5e']
+    const fineN = 280, yN = 220
+    const maxGapY = (yMax - yMin) * 0.06
+    let iso = ''
+    cValues.forEach((c, idx) => {
+      const isNull = Math.abs(c) < 1e-12
+      const color = isNull ? '#1a1715' : isoPalette[idx % isoPalette.length]
+      const dash = isNull ? '' : ' stroke-dasharray="6,4"'
+      const lw = isNull ? 2.6 : 2.0
+      const columns = []
+      for (let i = 0; i <= fineN; i++) {
+        const t = tMin + ((tMax - tMin) * i) / fineN
+        const roots = []
+        let prevY = null, prevVal = null
+        for (let j = 0; j <= yN; j++) {
+          const y = yMin + ((yMax - yMin) * j) / yN
+          const v = evalF(compiled.code, t, y) - c
+          if (prevVal !== null && isFinite(v) && isFinite(prevVal) && prevVal * v < 0) {
+            let a = prevY, b = y, fa = prevVal
+            for (let k = 0; k < 14; k++) {
+              const m = 0.5 * (a + b)
+              const fm = evalF(compiled.code, t, m) - c
+              if (!isFinite(fm)) break
+              if (fa * fm < 0) { b = m } else { a = m; fa = fm }
+            }
+            roots.push(0.5 * (a + b))
+          }
+          prevY = y; prevVal = v
+        }
+        columns.push({ t, roots })
+      }
+      let segs = ''
+      for (let i = 0; i < columns.length - 1; i++) {
+        const colA = columns[i], colB = columns[i + 1]
+        for (const ya of colA.roots) {
+          let best = null, bestDist = Infinity
+          for (const yb of colB.roots) {
+            const d = Math.abs(yb - ya)
+            if (d < bestDist) { bestDist = d; best = yb }
+          }
+          if (best !== null && bestDist < maxGapY) {
+            segs += `<line x1="${xToPx(colA.t).toFixed(2)}" y1="${yToPx(ya).toFixed(2)}" x2="${xToPx(colB.t).toFixed(2)}" y2="${yToPx(best).toFixed(2)}" stroke="${color}" stroke-width="${lw}" stroke-linecap="round"${dash}/>`
+          }
+        }
+      }
+      iso += segs
+    })
+    parts.push(iso)
+  }
+
+  // Equilibrium horizontal lines on the field plot
+  if (autonomous) {
+    const sortedEq = [...equilibria].sort((a, b) => a.y - b.y)
+    sortedEq.forEach(eq => {
+      const py = yToPx(eq.y)
+      if (py < PAD_T - 1 || py > PAD_T + plotH + 1) return
+      let dash = ''
+      let lw = 2.6
+      if (eq.kind === 'unstable') { dash = ' stroke-dasharray="10,5"'; lw = 2.2 }
+      else if (eq.kind !== 'stable') { dash = ' stroke-dasharray="10,4,2,4"'; lw = 2.2 }
+      parts.push(`<line x1="${PAD_L}" y1="${py.toFixed(2)}" x2="${PAD_L + plotW}" y2="${py.toFixed(2)}" stroke="#c1432f" stroke-width="${lw}"${dash}/>`)
+    })
+  }
+
+  // Plot frame
+  parts.push(`<rect x="${PAD_L}" y="${PAD_T}" width="${plotW}" height="${plotH}" fill="none" stroke="#8a8170" stroke-width="1.5"/>`)
+
+  // Tick labels
+  let labels = ''
+  for (let t = Math.ceil(tMin / tStep) * tStep; t <= tMax + 1e-9; t += tStep) {
+    const x = xToPx(t)
+    labels += `<text x="${x.toFixed(2)}" y="${(PAD_T + plotH + 16).toFixed(2)}" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="11" fill="#5a5347">${formatTick(t, tStep)}</text>`
+  }
+  for (let y = Math.ceil(yMin / yStep) * yStep; y <= yMax + 1e-9; y += yStep) {
+    const py = yToPx(y)
+    labels += `<text x="${(PAD_L - 8).toFixed(2)}" y="${(py + 4).toFixed(2)}" text-anchor="end" font-family="JetBrains Mono, monospace" font-size="11" fill="#5a5347">${formatTick(y, yStep)}</text>`
+  }
+  parts.push(labels)
+
+  // Axis names
+  parts.push(`<text x="${(PAD_L + plotW / 2).toFixed(2)}" y="${(PAD_T + plotH + 36).toFixed(2)}" text-anchor="middle" font-family="Fraunces, serif" font-style="italic" font-weight="600" font-size="14" fill="#1a1715">t</text>`)
+  parts.push(`<text transform="translate(16, ${(PAD_T + plotH / 2).toFixed(2)}) rotate(-90)" text-anchor="middle" font-family="Fraunces, serif" font-style="italic" font-weight="600" font-size="14" fill="#1a1715">y</text>`)
+
   // Solution curves
   let s = ''
   solutions.forEach(sol => {
     const all = [...sol.bwd.slice().reverse(), ...sol.fwd.slice(1)]
+    if (all.length === 0) return
     const d = all.map(([t, y], idx) => `${idx === 0 ? 'M' : 'L'}${xToPx(t).toFixed(2)},${yToPx(y).toFixed(2)}`).join(' ')
     s += `<path d="${d}" fill="none" stroke="${sol.color}" stroke-width="2.4" stroke-linejoin="round" stroke-linecap="round"/>`
     s += `<circle cx="${xToPx(sol.t0).toFixed(2)}" cy="${yToPx(sol.y0).toFixed(2)}" r="4" fill="${sol.color}" stroke="#faf6ec" stroke-width="1.5"/>`
   })
   parts.push(s)
-  // Phase line
+
+  // Phase line panel
   if (autonomous) {
     const px0 = PAD_L + plotW + 28
     const lineX = px0 + 24
     parts.push(`<rect x="${px0 - 6}" y="${PAD_T}" width="${phaseLineW - 16}" height="${plotH}" fill="#f0e9d6" stroke="#8a8170"/>`)
+    parts.push(`<text x="${(px0 + (phaseLineW - 16) / 2 - 6).toFixed(2)}" y="${(PAD_T - 4).toFixed(2)}" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="11" font-weight="600" fill="#1a1715">PHASE</text>`)
     parts.push(`<line x1="${lineX}" y1="${PAD_T + 6}" x2="${lineX}" y2="${PAD_T + plotH - 6}" stroke="#1a1715" stroke-width="2"/>`)
-    const sorted = [...equilibria].sort((a, b) => a.y - b.y)
-    sorted.forEach(eq => {
+
+    // Direction arrows in each subinterval
+    const sortedEq = [...equilibria].sort((a, b) => a.y - b.y)
+    const points = [yMin, ...sortedEq.map(e => e.y), yMax]
+    for (let i = 0; i < points.length - 1; i++) {
+      const yLo = points[i], yHi = points[i + 1]
+      const yMid = 0.5 * (yLo + yHi)
+      const sgn = evalF(compiled.code, 0, yMid)
+      if (!isFinite(sgn) || sgn === 0) continue
+      const dir = sgn > 0 ? -1 : 1
+      const arrowY = yToPx(yMid)
+      const intervalPx = Math.abs(yToPx(yLo) - yToPx(yHi))
+      const halfLen = Math.max(7, Math.min(24, intervalPx * 0.30))
+      const ahLen = Math.max(5, halfLen * 0.42)
+      const ahWidth = Math.max(3.5, halfLen * 0.30)
+      // shaft
+      parts.push(`<line x1="${lineX}" y1="${(arrowY - dir * halfLen).toFixed(2)}" x2="${lineX}" y2="${(arrowY + dir * (halfLen - ahLen * 0.6)).toFixed(2)}" stroke="#c1432f" stroke-width="3" stroke-linecap="round"/>`)
+      // head
+      const tipY = arrowY + dir * halfLen
+      const baseY = tipY - dir * ahLen
+      parts.push(`<polygon points="${lineX},${tipY.toFixed(2)} ${(lineX - ahWidth).toFixed(2)},${baseY.toFixed(2)} ${(lineX + ahWidth).toFixed(2)},${baseY.toFixed(2)}" fill="#c1432f"/>`)
+    }
+
+    // Equilibrium dots
+    sortedEq.forEach(eq => {
       const py = yToPx(eq.y)
       if (eq.kind === 'stable') {
-        parts.push(`<circle cx="${lineX}" cy="${py}" r="5.5" fill="#1a1715"/>`)
+        parts.push(`<circle cx="${lineX}" cy="${py.toFixed(2)}" r="5.5" fill="#1a1715"/>`)
       } else if (eq.kind === 'unstable') {
-        parts.push(`<circle cx="${lineX}" cy="${py}" r="5.5" fill="#faf6ec" stroke="#1a1715" stroke-width="2"/>`)
+        parts.push(`<circle cx="${lineX}" cy="${py.toFixed(2)}" r="5.5" fill="#faf6ec" stroke="#1a1715" stroke-width="2"/>`)
       } else {
-        parts.push(`<circle cx="${lineX}" cy="${py}" r="5.5" fill="#1a1715"/><circle cx="${lineX}" cy="${py}" r="5.5" fill="none" stroke="#1a1715" stroke-width="2"/>`)
+        // Semi-stable: filled half = stable side. semi-up → stable below;
+        // semi-down → stable above. SVG y grows downward, so "below" = larger py.
+        const r = 5.5
+        const stableIsLower = eq.kind === 'semi-up'
+        // Path for half-disk: semi-circle on the stable side, filled.
+        const startX = lineX - r, endX = lineX + r
+        const sweep = stableIsLower
+          ? `M ${startX} ${py.toFixed(2)} A ${r} ${r} 0 0 0 ${endX} ${py.toFixed(2)} Z`
+          : `M ${startX} ${py.toFixed(2)} A ${r} ${r} 0 0 1 ${endX} ${py.toFixed(2)} Z`
+        parts.push(`<circle cx="${lineX}" cy="${py.toFixed(2)}" r="${r}" fill="#faf6ec" stroke="#1a1715" stroke-width="2"/>`)
+        parts.push(`<path d="${sweep}" fill="#1a1715"/>`)
+        parts.push(`<circle cx="${lineX}" cy="${py.toFixed(2)}" r="${r}" fill="none" stroke="#1a1715" stroke-width="2"/>`)
       }
+      // y= label
+      parts.push(`<text x="${(lineX + 10).toFixed(2)}" y="${(py + 4).toFixed(2)}" font-family="JetBrains Mono, monospace" font-size="10" fill="#1a1715">y=${eq.y.toFixed(3)}</text>`)
     })
   }
+
   // Title
   parts.push(`<text x="${PAD_L}" y="${PAD_T - 8}" font-family="Fraunces, serif" font-style="italic" font-weight="600" font-size="14" fill="#1a1715">y′ = ${escapeXml(expr)}</text>`)
   parts.push(`</svg>`)
